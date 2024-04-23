@@ -23,7 +23,7 @@ functions = {
             "relu" : lambda x: -0.5 * (F.relu(x) ** 2.0).sum(),
             "softmax": lambda x: torch.logsumexp(x, dim=-1).sum(),
             "tanh": lambda x: torch.log(torch.cosh(x)).sum(),
-            "sparsemax": lambda x: (torch.sum(x*sparsemax(x, dim=-1), dim =-1) - torch.norm(sparsemax(x, dim=-1), dim=-1))
+            "sparsemax": lambda x: (torch.sum(x*sparsemax(x, dim=-1), dim =-1) - torch.norm(sparsemax(x, dim=-1), dim=-1)).sum()
 }
 class Lambda(nn.Module):
     def __init__(self, fn: Callable):
@@ -92,7 +92,7 @@ class Hopfield(nn.Module):
         scores = self.proj(g)
         scores[~mask] = -1e9
         x =self.fn(scores)
-        return x.sum()
+        return x
 
 
 class Attention(nn.Module):
@@ -103,13 +103,14 @@ class Attention(nn.Module):
         nheads: int = 12,
         beta: Optional[float] = None,
         bias: bool = False,
+        att_fn: str = "softmax"
     ):
         super().__init__()
         assert qk_dim > 0 and in_dim > 0
         self.nheads = nheads
         self.h, self.d = nheads, qk_dim
         self.beta = beta if beta is not None else 1.0 / (qk_dim**0.5)
-
+        self.att_fn = functions[att_fn]
         self.wq = nn.Parameter(torch.normal(0, 0.002, size=(nheads, qk_dim, in_dim)))
         self.wk = nn.Parameter(torch.normal(0, 0.002, size=(nheads, qk_dim, in_dim)))
 
@@ -132,7 +133,7 @@ class Attention(nn.Module):
         mask = expanded_tensor.unsqueeze(-1).repeat(1, 1, 1, mask.shape[-1])
         mask = mask*mask.transpose(-1, -2)
         A[~mask] = -1e9
-        e = (-1.0 / self.beta) * torch.logsumexp(self.beta * A, dim=-1).sum()
+        e = (-1.0 / self.beta) * self.att_fn(self.beta*A)
         return e
 
 
@@ -147,11 +148,12 @@ class ETBlock(nn.Module):
         attn_bias: bool = False,
         hn_bias: bool = False,
         hn_fn: Callable = lambda x: -0.5 * (F.relu(x) ** 2.0).sum(),
+        att_fn: str = "softmax"
     ):
         super().__init__()
         assert qk_dim > 0 and in_dim > 0
         self.hn = Hopfield(in_dim, hn_mult, hn_fn, hn_bias)
-        self.attn = Attention(in_dim, qk_dim, nheads, attn_beta, attn_bias)
+        self.attn = Attention(in_dim, qk_dim, nheads, attn_beta, attn_bias, att_fn)
 
     def energy(
         self,
@@ -185,6 +187,7 @@ class ET(pl.LightningModule):
         attn_bias: bool = h_params.get("attn_bias")
         hn_bias: bool = h_params.get("hn_bias")
         hn_fn: Callable = h_params.get("hn_fn")
+        att_fn: Callable = h_params.get("att_fn")
         time_steps: int = h_params.get("time_steps")
         blocks: int = h_params.get("blocks")
         emb_type: int = h_params.get("emb_type")
@@ -252,6 +255,7 @@ class ET(pl.LightningModule):
                             attn_bias,
                             hn_bias,
                             hn_fn,
+                            att_fn,
                         ),
                     ]
                 )
