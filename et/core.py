@@ -13,17 +13,21 @@ import logging
 import numpy as np
 from utils import build_optimizer, build_scheduler
 from hflayers import HopfieldPooling
-from entmax import entmax15, sparsemax, normmax_bisect
+from entmax import entmax15, sparsemax, normmax_bisect, entmax_bisect
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+
 
 TENSOR = torch.Tensor
 
 shell_logger = logging.getLogger(__name__)
-
 functions = {
-            "relu" : lambda x: -0.5 * (F.relu(x) ** 2.0).sum(),
-            "softmax": lambda x: torch.logsumexp(x, dim=-1).sum(),
-            "tanh": lambda x: torch.log(torch.cosh(x)).sum(),
-            "sparsemax": lambda x: (torch.sum(x*sparsemax(x, dim=-1), dim =-1) - torch.norm(sparsemax(x, dim=-1), dim=-1)).sum()
+            "relu" : lambda x: - 0.5 * (F.relu(x) ** 2.0).sum(),
+            "softmax": lambda x: -1*torch.logsumexp(x, dim=-1).sum(),
+            "tanh": lambda x: -1*torch.log(torch.cosh(x)).sum(),
+            "sparsemax": lambda x: -1*(torch.sum(x*sparsemax(x, dim=-1), dim =-1) - torch.norm(sparsemax(x, dim=-1), dim=-1)).sum(),
+            "normmax": lambda x: -1*(torch.sum(x*normmax_bisect(x, dim=-1, alpha=5), dim =-1) - torch.norm(normmax_bisect(x, dim=-1, alpha=5,), dim=-1)).sum(),
+            "entmax": lambda x: -1*(torch.sum(x*entmax15(x, dim=-1, k=None), dim =-1) - torch.norm(entmax15(x, dim=-1, k=None), dim=-1)).sum()
+
 }
 class Lambda(nn.Module):
     def __init__(self, fn: Callable):
@@ -90,7 +94,7 @@ class Hopfield(nn.Module):
         
     def forward(self, g: TENSOR, mask):
         scores = self.proj(g)
-        scores[~mask] = -1e9
+        scores[~mask] = -1e6
         x =self.fn(scores)
         return x
 
@@ -132,10 +136,9 @@ class Attention(nn.Module):
         # Expand along the last dimension
         mask = expanded_tensor.unsqueeze(-1).repeat(1, 1, 1, mask.shape[-1])
         mask = mask*mask.transpose(-1, -2)
-        A[~mask] = -1e9
-        e = (-1.0 / self.beta) * self.att_fn(self.beta*A)
+        A[~mask] = -1e6
+        e = (1.0 / self.beta) * self.att_fn(self.beta*A)
         return e
-
 
 class ETBlock(nn.Module):
     def __init__(
@@ -193,6 +196,7 @@ class ET(pl.LightningModule):
         emb_type: int = h_params.get("emb_type")
         emb_path: int = h_params.get("emb_path")
         use_cls: bool = h_params.get("use_cls")
+        self.baseline: bool = h_params.get("baseline", False)
         self.alpha: int = h_params.get("alpha")
         super().__init__()
         self.K = time_steps
@@ -236,32 +240,33 @@ class ET(pl.LightningModule):
         )
 
         self.pos = PositionEncode(tkn_dim) 
-        self.cls = nn.Parameter(torch.ones(1, 1, tkn_dim))
+        #self.cls = nn.Parameter(torch.ones(1, 1, tkn_dim))
         
-        self.hopfield_pooling = HopfieldPooling(
-            input_size=out_dim, output_size=out_dim, num_heads=8)
-
-        self.blocks = nn.ModuleList(
-            [
-                nn.ModuleList(
-                    [
-                        EnergyLayerNorm(tkn_dim),
-                        ETBlock(
-                            tkn_dim,
-                            qk_dim,
-                            nheads,
-                            hn_mult,
-                            attn_beta,
-                            attn_bias,
-                            hn_bias,
-                            hn_fn,
-                            att_fn,
-                        ),
-                    ]
-                )
-                for _ in range(blocks)
-            ]
-        )
+        if self.baseline:
+            self.transformer_encoder_layer = TransformerEncoderLayer(tkn_dim, nheads, 256)#, dropout=0.1)
+            self.transformer_encoder = TransformerEncoder(self.transformer_encoder_layer, 1)
+        else:
+            self.blocks = nn.ModuleList(
+                [
+                    nn.ModuleList(
+                        [
+                            EnergyLayerNorm(tkn_dim),
+                            ETBlock(
+                                tkn_dim,
+                                qk_dim,
+                                nheads,
+                                hn_mult,
+                                attn_beta,
+                                attn_bias,
+                                hn_bias,
+                                hn_fn,
+                                att_fn,
+                            ),
+                        ]
+                    )
+                    for _ in range(blocks)
+                ]
+            )
         self.output_layer = nn.Sequential(
             nn.Dropout(p=0.1),
             nn.Linear(out_dim, self.nb_classes),
@@ -299,18 +304,17 @@ class ET(pl.LightningModule):
         *,
         return_energy: bool = False,
     ):
-
         x = self.embed_layer(x)
         x = self.pos(x)
-
-        x, energies = self.evolve(
-            x, attn_mask=attn_mask, return_energy=return_energy)
+        if self.baseline:
+            x = self.transformer_encoder(x , src_key_padding_mask=~attn_mask.t())
+        else:
+            x, energies = self.evolve(
+                x, attn_mask=attn_mask, return_energy=return_energy)
         
         x = self.decode(x)
-        yh = x[:, :]
-        #IMPLEMENT POOOOOOOLING FOR USE_CLS=False
         if return_energy:
-            return self.output_layer(yh), energies
+            return self.output_layer(x), energies
         #pooled = self.hopfield_pooling(x)
         pooled = torch.mean(x, dim=1, keepdim=True)
         return self.output_layer(pooled)
